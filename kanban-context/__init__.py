@@ -171,7 +171,7 @@ def crossbot_send(
     """Send a cross-bot message via the shared outbox.
 
     Args:
-        to_bot: Target bot profile name (e.g. 'ti', 'bravo')
+        to_bot: Target bot profile name (e.g. 'profile_name')
         subject: Short message subject/headline
         body: Full message body
         kanban_task_id: Optional Kanban task ID for tracking
@@ -451,12 +451,123 @@ def _trunc(text: str, max_len: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Auto-cleaning — lightweight self-maintenance
+# ---------------------------------------------------------------------------
+
+_CLEANUP_INTERVAL: float = 86400.0
+_last_cleanup: float = 0.0
+
+
+def _get_cleanup_interval() -> int:
+    try:
+        return max(3600, int(os.environ.get("KANBAN_CONTEXT_CLEANUP_INTERVAL", "86400")))
+    except (ValueError, TypeError):
+        return 86400
+
+
+def _get_outbox_retention_days() -> int:
+    try:
+        return max(1, int(os.environ.get("KANBAN_CONTEXT_OUTBOX_RETENTION", "14")))
+    except (ValueError, TypeError):
+        return 14
+
+
+def _get_log_retention_days() -> int:
+    try:
+        return max(1, int(os.environ.get("KANBAN_CONTEXT_LOG_RETENTION", "7")))
+    except (ValueError, TypeError):
+        return 7
+
+
+def _cleanup_old_outbox() -> int:
+    """Delete completed outbox messages older than retention."""
+    retention = _get_outbox_retention_days()
+    cutoff = time.time() - retention * 86400
+    conn = _open_shared_db()
+    try:
+        cur = conn.execute(
+            "DELETE FROM outbox WHERE status='done' AND completed_at IS NOT NULL AND completed_at < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        deleted = cur.rowcount
+        if deleted > 0:
+            logger.info("kanban-context: cleaned %d old outbox (retention=%dd)", deleted, retention)
+        return deleted
+    except Exception as exc:
+        logger.warning("kanban-context: outbox cleanup failed: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+def _cleanup_stale_pending() -> int:
+    """Mark pending messages >7d as stale (target bot likely inactive)."""
+    cutoff = time.time() - 7 * 86400
+    conn = _open_shared_db()
+    try:
+        cur = conn.execute(
+            "UPDATE outbox SET status='done', response_text='[stale - abandoned]' "
+            "WHERE status='pending' AND ts < ?",
+            (cutoff,),
+        )
+        conn.commit()
+        stale = cur.rowcount
+        if stale > 0:
+            logger.info("kanban-context: marked %d stale pending as abandoned", stale)
+        return stale
+    except Exception as exc:
+        logger.warning("kanban-context: stale cleanup failed: %s", exc)
+        return 0
+    finally:
+        conn.close()
+
+
+def _cleanup_old_log_files() -> int:
+    """Remove kanban-context log files older than retention."""
+    retention = _get_log_retention_days()
+    log_dir = _hermes_home() / "logs" / "kanban-context"
+    if not log_dir.is_dir():
+        return 0
+    cutoff = time.time() - retention * 86400
+    removed = 0
+    try:
+        for f in log_dir.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        if removed > 0:
+            logger.info("kanban-context: cleaned %d old log files (retention=%dd)", removed, retention)
+        return removed
+    except Exception as exc:
+        logger.warning("kanban-context: log cleanup failed: %s", exc)
+        return 0
+
+
+def run_maintenance(force: bool = False) -> None:
+    """Run periodic maintenance — outbox prune, stale mark, log rotate.
+
+    Runs at most once per CLEANUP_INTERVAL unless *force* is True.
+    """
+    global _last_cleanup
+    now = time.time()
+    interval = _get_cleanup_interval()
+    if not force and (now - _last_cleanup) < interval:
+        return
+    _cleanup_old_outbox()
+    _cleanup_stale_pending()
+    _cleanup_old_log_files()
+    _last_cleanup = now
+
+
+# ---------------------------------------------------------------------------
 # Hook callbacks
 # ---------------------------------------------------------------------------
 
 
 def _inject_kanban_context(**kwargs) -> Optional[Dict[str, str]]:
     """pre_llm_call hook — injects board activity + pending messages."""
+    run_maintenance()
     parts = []
 
     # Part 1: Kanban board activity
@@ -480,14 +591,329 @@ def _inject_kanban_context(**kwargs) -> Optional[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Plugin registration
+# Proactive validation — runs at plugin load (install-time check)
 # ---------------------------------------------------------------------------
 
 
-def register(ctx) -> None:
-    ctx.register_hook("pre_llm_call", _inject_kanban_context)
-    logger.info(
-        "kanban-context plugin v2.0 registered "
-        "(event_limit=%d, lookback=%dh, home=%s, bot=%s)",
-        _event_limit(), _lookback_hours(), _hermes_home(), _my_bot_name(),
+class ValidationResult:
+    """Collects warnings and errors during plugin validation."""
+
+    errors: List[str]
+    warnings: List[str]
+
+    def __init__(self) -> None:
+        self.errors = []
+        self.warnings = []
+
+    def ok(self) -> bool:
+        return len(self.errors) == 0
+
+    def log(self, label: str = "kanban-context") -> None:
+        for w in self.warnings:
+            logger.warning("%s: ⚠️  %s", label, w)
+        for e in self.errors:
+            logger.error("%s: ❌ %s", label, e)
+        if not self.errors and not self.warnings:
+            logger.info("%s: ✅ all validations passed", label)
+
+
+def _validate_python_version(vr: ValidationResult) -> None:
+    """Check Python >= 3.11."""
+    import sys
+    if sys.version_info < (3, 11):
+        vr.errors.append(
+            f"Python 3.11+ required (found {sys.version_info.major}.{sys.version_info.minor}). "
+            "Please upgrade your Python interpreter."
+        )
+
+
+def _validate_hermes_version(vr: ValidationResult) -> None:
+    """Try to detect Hermes Agent version."""
+    try:
+        from hermes_core.version import __version__ as hv
+        parts = str(hv).lstrip("v").split(".")
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        if (major, minor) < (0, 13):
+            vr.warnings.append(
+                f"Hermes Agent v{'.'.join(parts)} detected — plugin was built for v0.13+. "
+                "If you encounter issues, consider upgrading Hermes."
+            )
+    except ImportError:
+        vr.warnings.append(
+            "Could not detect Hermes Agent version (hermes_core.version not found). "
+            "Assuming compatibility — if you hit issues, check Hermes >= v0.13.0."
+        )
+
+
+def _validate_multi_agent_plugin(vr: ValidationResult) -> None:
+    """Check that multi-agent-context plugin is installed (required dependency)."""
+    plugin_dirs = _hermes_home() / "plugins"
+    if not plugin_dirs.is_dir():
+        vr.warnings.append(
+            f"Plugin directory not found at {plugin_dirs}. "
+            "Make sure multi-agent-context is installed for the shared DB."
+        )
+        return
+
+    found = False
+    try:
+        for d in plugin_dirs.iterdir():
+            if d.is_dir() and d.name == "multi-agent-context":
+                found = True
+                break
+    except PermissionError:
+        vr.warnings.append(
+            f"Cannot read plugin directory {plugin_dirs} (permission). "
+            "Please verify multi-agent-context is installed."
+        )
+        return
+
+    if not found:
+        vr.warnings.append(
+            "multi-agent-context plugin not found in plugins directory. "
+            "kanban-context's cross-bot messaging requires multi-agent-context "
+            "for the shared SQLite database. "
+            "Install it from https://github.com/franklinbravos/hermes-community-plugins"
+        )
+
+
+def _validate_shared_db(vr: ValidationResult) -> None:
+    """Check shared DB path is writable and outbox table can be created."""
+    path = _shared_db_path()
+    try:
+        parent = os.path.dirname(path)
+        os.makedirs(parent, exist_ok=True)
+        # Try to open and create the table
+        conn = sqlite3.connect(path, timeout=5)
+        conn.execute(_OUTBOX_TABLE)
+        conn.commit()
+        conn.close()
+        logger.debug("kanban-context: shared DB OK at %s", path)
+    except Exception as exc:
+        vr.errors.append(
+            f"Cannot create/open shared database at '{path}': {exc}. "
+            "Check directory permissions and disk space."
+        )
+
+
+def _validate_kanban_db(vr: ValidationResult) -> None:
+    """Check that kanban DB exists or kanban boards dir exists."""
+    default = _kanban_db()
+    boards = _boards_dir()
+
+    if default.is_file():
+        logger.debug("kanban-context: kanban DB found at %s", default)
+        return
+    if boards.is_dir():
+        logger.debug("kanban-context: kanban boards dir found at %s", boards)
+        return
+
+    vr.warnings.append(
+        f"No kanban database found at {default} and no boards dir at {boards}. "
+        "Kanban activity injection will be empty until a board is created. "
+        "Use 'hermes kanban create-board <name>' to create one."
     )
+
+
+def _validate_bot_name(vr: ValidationResult) -> None:
+    """Check that a bot name can be resolved."""
+    name = _my_bot_name()
+    if name and name != "bot":
+        logger.debug("kanban-context: bot name resolved as '%s'", name)
+        return
+
+    # Only a warning — the fallback name "bot" works for single-instance setups
+    vr.warnings.append(
+        "No explicit bot name set (CROSSBOT_BOT_NAME). "
+        "Falling back to profile name or 'bot'. "
+        "For multi-bot setups, set CROSSBOT_BOT_NAME env var "
+        "to each bot's unique name to enable cross-bot messaging."
+    )
+
+
+def _validate_env_vars(vr: ValidationResult) -> None:
+    """Validate numeric env vars at load time."""
+    for key, default, label in [
+        ("KANBAN_CONTEXT_EVENT_LIMIT", "10", "event limit"),
+        ("KANBAN_CONTEXT_LOOKBACK_H", "12", "lookback hours"),
+    ]:
+        raw = os.environ.get(key, default)
+        try:
+            val = int(raw)
+            if val < 0:
+                vr.warnings.append(
+                    f"{key}={raw} is negative — using default ({default})."
+                )
+            if key == "KANBAN_CONTEXT_EVENT_LIMIT" and val > 100:
+                vr.warnings.append(
+                    f"{key}={val} is very high — may exceed context window."
+                )
+            if key == "KANBAN_CONTEXT_LOOKBACK_H" and val > 168:
+                vr.warnings.append(
+                    f"{key}={val} (>{168}h = 1 week) — large lookback may "
+                    "produce too many events."
+                )
+        except (ValueError, TypeError):
+            vr.warnings.append(
+                f"{key}={raw} is not a valid integer — using default ({default})."
+            )
+
+
+def _validate_log_dir(vr: ValidationResult) -> None:
+    """Ensure the kanban plugin log directory exists and is writable."""
+    log_dir = _hermes_home() / "logs" / "kanban-context"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        vr.warnings.append(
+            f"Cannot create log directory {log_dir}: {exc}. "
+            "Plugin will still work but logs won't be persisted to disk."
+        )
+
+
+def run_validation() -> ValidationResult:
+    """Run all validation checks and return the result."""
+    vr = ValidationResult()
+    _validate_python_version(vr)
+    _validate_hermes_version(vr)
+    _validate_multi_agent_plugin(vr)
+    _validate_shared_db(vr)
+    _validate_kanban_db(vr)
+    _validate_bot_name(vr)
+    _validate_env_vars(vr)
+    _validate_log_dir(vr)
+    return vr
+
+
+def _get_plugin_version() -> str:
+    """Read plugin version from plugin.yaml."""
+    plugin_yaml = _hermes_home() / "plugins" / "kanban-context" / "plugin.yaml"
+    try:
+        with open(str(plugin_yaml)) as f:
+            for line in f:
+                if line.startswith("version:"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return "2.0.0"
+
+
+# ---------------------------------------------------------------------------
+# Dashboard / Status — inspectable via agent or direct call
+# ---------------------------------------------------------------------------
+
+
+def kanban_status() -> str:
+    """Return a human-readable status report of the kanban-context plugin.
+
+    Can be called by the agent when the user asks about bot/plugin status.
+    Returns a formatted string with sections:
+      - Plugin version and config
+      - Bot identity
+      - Boards discovered
+      - Outbox statistics
+      - Validation status
+    """
+    lines: List[str] = []
+    sep = "-" * 40
+
+    # Header
+    lines.append("[Kanban-Context Status]")
+    lines.append("")
+
+    # Version & config
+    lines.append(f"Plugin version: {_get_plugin_version()}")
+    lines.append(f"Python:         {__import__('sys').version_info.major}.{__import__('sys').version_info.minor}")
+    try:
+        from hermes_core.version import __version__ as hv
+        lines.append(f"Hermes Agent:   v{hv}")
+    except ImportError:
+        lines.append("Hermes Agent:   (unknown)")
+    lines.append(sep)
+
+    # Bot identity
+    lines.append(f"Bot name:       {_my_bot_name()}")
+    lines.append(f"Hermes home:    {_hermes_home()}")
+    lines.append(f"Shared DB:      {_shared_db_path()}")
+    lines.append(f"Kanban DB:      {_kanban_db()}")
+
+    # Configuration
+    lines.append(sep)
+    lines.append(f"Event limit:    {_event_limit()} events")
+    lines.append(f"Lookback:       {_lookback_hours()}h")
+    lines.append(f"Cleanup:        every {_get_cleanup_interval() // 3600}h")
+    lines.append(f"Outbox retain:  {_get_outbox_retention_days()}d")
+    lines.append(f"Log retain:     {_get_log_retention_days()}d")
+    lines.append(sep)
+
+    # Boards discovered
+    boards = _iter_boards()
+    if boards:
+        lines.append(f"Kanban boards:  {len(boards)} found")
+        for db_path, label in boards:
+            try:
+                db_size = os.path.getsize(db_path) / 1024
+            except OSError:
+                db_size = 0.0
+            lines.append(f"  - {label} ({db_size:.0f} KB)")
+    else:
+        lines.append("Kanban boards:  none (activity injection will be empty)")
+    lines.append(sep)
+
+    # Outbox stats
+    try:
+        conn = _open_shared_db()
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM outbox GROUP BY status"
+        ).fetchall()
+        conn.close()
+        stats = {r[0]: r[1] for r in rows}
+        total = sum(stats.values()) if stats else 0
+        lines.append(f"Outbox total:   {total} messages")
+        for status in ("pending", "done", "delivered"):
+            count = stats.get(status, 0)
+            if count > 0:
+                lines.append(f"  - {status}: {count}")
+    except Exception as exc:
+        lines.append(f"Outbox:         error reading — {exc}")
+
+    # Validation
+    vr = run_validation()
+    if vr.ok() and not vr.warnings:
+        lines.append(sep)
+        lines.append("Health:         ✅ all checks passed")
+    else:
+        lines.append(sep)
+        lines.append(f"Health:         {'❌ errors' if vr.errors else '⚠ warnings'}")
+        for w in vr.warnings[:3]:
+            lines.append(f"  ⚠ {w[:80]}")
+        for e in vr.errors[:3]:
+            lines.append(f"  ❌ {e[:80]}")
+
+    return "\n".join(lines)
+
+
+def _handle_status_command(**kwargs) -> Optional[Dict[str, str]]:
+    """pre_llm_call hook — detect /kanban-status and inject status context.
+
+    When the user sends a message starting with /kanban-status, this
+    hook replaces the normal context injection with a status report.
+    """
+    user_message = kwargs.get("user_message", "")
+    if not user_message or not user_message.strip().startswith("/kanban-status"):
+        return None
+
+    # Return status as context so the agent can read and respond
+    status = kanban_status()
+    logger.info("kanban-context: status requested (size=%d chars)", len(status))
+    return {"context": status}
+
+
+def register(ctx) -> None:
+    # Run proactive validation
+    vr = run_validation()
+    vr.log()
+
+    ctx.register_hook("pre_llm_call", _inject_kanban_context)
+    ctx.register_hook("pre_llm_call", _handle_status_command)
