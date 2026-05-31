@@ -219,7 +219,68 @@ cp -r multi-agent-context ~/.hermes/plugins/multi-agent-context
 
 ---
 
-### 3. ~~[`native-vision/`](./native-vision/)~~ ⚡ — ⚠️ DEPRECATED
+### 3. [`kanban-context/`](./kanban-context/) 🗂️
+
+**Injects recent Kanban board activity into agent context** so agents can see what tasks are moving through the board — without requiring explicit board queries.
+
+#### The Problem
+
+The Hermes Kanban system powers multi-agent work queues with dependency chains, worker claims, and automatic task promotion. But the board lives in a SQLite database that agents never read during conversation. Workers using the `kanban_*` tools see their assigned task, but orchestrators and conversation agents have **zero visibility** into:
+
+- Tasks being created and moving through the pipeline
+- Blocked items affecting downstream work
+- Completed tasks whose outputs may be useful
+- Worker progress notes (heartbeats)
+
+#### The Solution
+
+This plugin hooks into `pre_llm_call` and reads the last N events from the shared Kanban SQLite database. It injects a structured context block before every LLM call:
+
+```
+[Recent Kanban Activity]
+
+- [2h ago] [kanban] **Design auth schema** (created → ready)
+- [30m ago] [kanban] **Implement auth API** (completed)
+- [5m ago] [linkedin-content] **Weekly trends post** (in progress: scraper running)
+
+[End Kanban Activity]
+```
+
+#### Key Features
+
+- **Multi-board:** Scans both default and named boards (`kanban/boards/*/kanban.db`)
+- **Chronological merge:** Events from all boards are sorted by time
+- **13 event kinds recognised:** created, assigned, claimed, completed, blocked, unblocked, heartbeat, spawned, archived, commented, linked, edited, promoted
+- **No extra dependencies:** Uses Python stdlib (`sqlite3`, `json`, `os`)
+- **Path resolution via `get_hermes_home()`:** Works with any profile or `HERMES_HOME` override
+
+#### Relationship to multi-agent-context
+
+The `multi-agent-context` plugin (above) shares conversation history across Telegram/Discord bots. `kanban-context` complements it by sharing **board** history — together they give agents both conversational and operational context.
+
+#### Config (Environment Variables)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `KANBAN_CONTEXT_EVENT_LIMIT` | `10` | Max events to inject per pre-LLM context block |
+| `KANBAN_CONTEXT_LOOKBACK_H` | `12` | Lookback window in hours |
+
+#### Quick Install
+
+```bash
+cp -r kanban-context ~/.hermes/plugins/kanban-context
+# Add to config.yaml:
+#   plugins:
+#     enabled:
+#       - kanban-context
+# Restart gateway
+```
+
+For multi-profile setups, symlink or copy into each profile's plugins dir. See `kanban-context/README.md` for details.
+
+---
+
+### 4. ~~[`native-vision/`](./native-vision/)~~ ⚡ — ⚠️ DEPRECATED
 
 > ⚠️ **Now a built-in feature in Hermes Agent v0.11.0+ — this plugin is no longer needed. Kept here for historical reference.**
 
@@ -246,6 +307,7 @@ Bypass the auxiliary vision model and send images directly to vision-capable mai
 - Python 3.11+
 - **`async-delegate`:** No extra dependencies — uses Python stdlib only
 - **`multi-agent-context`:** `pip install requests` (usually already installed). Telegram path uses Python's built-in `sqlite3` — no extra deps.
+- **`kanban-context`:** No extra dependencies — uses Python stdlib only (`sqlite3`, `json`, `os`)
 
 ## Deployment Notes
 

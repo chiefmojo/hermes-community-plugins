@@ -46,7 +46,6 @@ _SELF_BOT_ID: Optional[str] = None
 _discord_cache: Dict[str, Tuple[float, str]] = {}
 _CACHE_TTL: float = 10.0
 
-_TG_DB_DEFAULT = "/root/.hermes/data/multi_agent_tg_shared.db"
 _TG_DB_TTL_HOURS: float = 48.0  # Prune messages older than this
 
 
@@ -149,8 +148,17 @@ def _format_discord_messages(messages: List[dict], self_bot_id: Optional[str], l
 # Telegram shared SQLite helpers
 # ---------------------------------------------------------------------------
 
+def _hermes_home_default() -> str:
+    """Resolve HERMES_HOME, falling back to ~/.hermes."""
+    from pathlib import Path
+    return os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+
+
 def _tg_db_path() -> str:
-    return os.environ.get("MULTI_AGENT_TG_DB_PATH", _TG_DB_DEFAULT).strip()
+    return os.environ.get(
+        "MULTI_AGENT_TG_DB_PATH",
+        os.path.join(_hermes_home_default(), "data", "multi_agent_tg_shared.db"),
+    ).strip()
 
 
 def _tg_open_db():
