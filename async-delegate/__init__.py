@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 TASKS_DIR = Path.home() / ".hermes" / "async-tasks"
 MAX_OUTPUT_CHARS = 8000
-TASK_TIMEOUT_SECS = 1800  # 30 min — mark as timed out after this
+TASK_TIMEOUT_SECS = 0  # No timeout — kill manually if stuck
 CLEANUP_MAX_AGE_SECS = 86400  # 24 hrs — delete task files after this
 
 # ---------------------------------------------------------------------------
@@ -73,6 +73,10 @@ def _done_path(task_id: str) -> Path:
 
 def _err_path(task_id: str) -> Path:
     return TASKS_DIR / f"{task_id}.err"
+
+
+def _progress_path(task_id: str) -> Path:
+    return TASKS_DIR / f"{task_id}.progress"
 
 
 def _read_meta(task_id: str) -> Optional[dict]:
@@ -360,7 +364,69 @@ def _ensure_watcher() -> None:
 _ASYNC_DEFAULT_TOOLSETS = "web,terminal,file,browser,vision"
 
 
-def delegate_async_tool(goal: str, context: str = "", inject_mode: str = "queue", toolsets: str = "") -> str:
+def _load_delegation_config() -> dict:
+    """Load delegation model config from config.yaml.
+
+    Returns dict with keys: model, provider
+    (values may be empty strings if not configured).
+    The base_url/api_key are NOT needed here — the subprocess uses
+    the provider's own credentials from config resolution.
+    """
+    result = {"model": "", "provider": ""}
+    try:
+        import yaml
+        from hermes_constants import get_hermes_home
+        config_path = Path(get_hermes_home()) / "config.yaml"
+        if config_path.exists():
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            deleg = cfg.get("delegation", {}) or {}
+            result["model"] = str(deleg.get("model", "")).strip()
+            result["provider"] = str(deleg.get("provider", "")).strip()
+    except Exception as e:
+        logger.warning("async-delegate: could not load delegation config: %s", e)
+    return result
+
+
+def _resolve_delegation_model(task_model: str = "", task_provider: str = "") -> tuple:
+    """Resolve which model/provider to use for a subagent.
+
+    Priority:
+      1. task_model / task_provider (per-task override from delegate_async call)
+      2. delegation.model + delegation.provider from config.yaml
+      3. empty (fall back to hermes chat default = main model)
+
+    When a per-task model is given WITHOUT a per-task provider, we skip
+    --provider so hermes chat can auto-resolve the right provider for
+    that model (e.g. step-3.7-flash → stepfun, mimo-v2.5-pro → xiaomi).
+
+    Returns (model_flag, provider_flag) tuple for CLI args.
+    """
+    deleg = _load_delegation_config()
+
+    # Resolve model: per-task > delegation config > empty
+    model = task_model.strip() or deleg["model"]
+
+    # Resolve provider: per-task > delegation config
+    # BUT: if model was overridden per-task and no provider given, skip provider
+    # so hermes auto-resolves based on the model name
+    if task_provider.strip():
+        provider = task_provider.strip()
+    elif task_model.strip():
+        # Per-task model override without explicit provider — let hermes auto-resolve
+        provider = ""
+    else:
+        # Using delegation config or default — pass delegation provider if set
+        provider = deleg["provider"]
+
+    model_flag = f'-m "{model}"' if model else ""
+    provider_flag = f'--provider "{provider}"' if provider else ""
+
+    return model_flag, provider_flag
+
+
+def delegate_async_tool(goal: str, context: str = "", inject_mode: str = "queue",
+                        toolsets: str = "", model: str = "", provider: str = "") -> str:
     """Spawn a background subagent and return immediately."""
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -370,6 +436,10 @@ def delegate_async_tool(goal: str, context: str = "", inject_mode: str = "queue"
 
     # Resolve toolsets — use provided or fall back to sensible default
     resolved_toolsets = toolsets.strip() if toolsets.strip() else _ASYNC_DEFAULT_TOOLSETS
+
+    # Resolve model (per-task > delegation config > main model default)
+    model_flag, provider_flag = _resolve_delegation_model(model, provider)
+    resolved_model_desc = model or "(delegation config)"
 
     task_id = f"async_{uuid.uuid4().hex[:8]}"
 
@@ -381,6 +451,15 @@ def delegate_async_tool(goal: str, context: str = "", inject_mode: str = "queue"
         "\n\nIMPORTANT: Do NOT use the delegate_async or delegate_task tool. "
         "Complete this task yourself using your own tools."
     )
+    # Auto-inject progress tracking instruction
+    progress_file = _progress_path(task_id)
+    prompt += (
+        f"\n\nPROGRESS TRACKING: After each major action (e.g., completing a web search, "
+        f"reading a source, finishing a section of your report), append a short one-line "
+        f"status update to {progress_file} using the terminal tool. "
+        f"Format: `echo \"[$(date +%H:%M)] did X\" >> {progress_file}`. "
+        f"Keep lines brief — this is for progress monitoring, not logging."
+    )
 
     # Write initial metadata
     meta = {
@@ -390,6 +469,7 @@ def delegate_async_tool(goal: str, context: str = "", inject_mode: str = "queue"
         "spawned_at": time.time(),
         "inject_mode": inject_mode,
         "toolsets": resolved_toolsets,
+        "model": resolved_model_desc,
     }
     _write_meta(task_id, meta)
 
@@ -403,11 +483,15 @@ def delegate_async_tool(goal: str, context: str = "", inject_mode: str = "queue"
     err_file = _err_path(task_id)
     hermes_bin = _find_hermes()
 
+    # Build the hermes chat command with optional model/provider flags
+    model_part = f" {model_flag}" if model_flag else ""
+    provider_part = f" {provider_flag}" if provider_flag else ""
+
     wrapper_script = TASKS_DIR / f"{task_id}.sh"
     wrapper_script.write_text(
         f'#!/bin/bash\n'
         f'PROMPT=$(cat "{prompt_file}")\n'
-        f'"{hermes_bin}" chat -q "$PROMPT" -Q -t "{resolved_toolsets}" >"{out_file}" 2>"{err_file}"\n'
+        f'"{hermes_bin}" chat -q "$PROMPT" -Q -t "{resolved_toolsets}"{model_part}{provider_part} >"{out_file}" 2>"{err_file}"\n'
         f'echo $? >"{done_file}"\n'
     )
     wrapper_script.chmod(0o755)
@@ -470,6 +554,18 @@ def check_async_tasks_tool(task_id: str = "") -> str:
             if out.exists():
                 meta["result"] = out.read_text()[:MAX_OUTPUT_CHARS]
 
+        # Include progress log for running tasks
+        if meta.get("status") == "running":
+            prog = _progress_path(task_id)
+            if prog.exists():
+                try:
+                    lines = prog.read_text().strip().split('\n')
+                    # Last 15 progress lines
+                    meta["progress"] = lines[-15:]
+                    meta["progress_total"] = len(lines)
+                except Exception:
+                    pass
+
         return json.dumps(meta, indent=2)
 
     # List all tasks
@@ -504,12 +600,13 @@ def _refresh_status(task_id: str, meta: dict) -> None:
         meta["completed_at"] = time.time()
         return
 
-    # Check for timeout
-    elapsed = time.time() - meta.get("spawned_at", 0)
-    if elapsed > TASK_TIMEOUT_SECS:
-        meta["status"] = "timeout"
-        meta["completed_at"] = time.time()
-        logger.warning(f"async-delegate: task {task_id} timed out after {int(elapsed)}s")
+    # Check for timeout (skip if TASK_TIMEOUT_SECS == 0)
+    if TASK_TIMEOUT_SECS > 0:
+        elapsed = time.time() - meta.get("spawned_at", 0)
+        if elapsed > TASK_TIMEOUT_SECS:
+            meta["status"] = "timeout"
+            meta["completed_at"] = time.time()
+            logger.warning(f"async-delegate: task {task_id} timed out after {int(elapsed)}s")
 
 
 # ---------------------------------------------------------------------------
@@ -616,8 +713,8 @@ def pre_llm_inject_results(**kwargs) -> Optional[Dict[str, str]]:
 
             done_file = _done_path(task_id)
             if not done_file.exists():
-                # Check timeout
-                if now - meta.get("spawned_at", 0) > TASK_TIMEOUT_SECS:
+                # Check timeout (skip if disabled)
+                if TASK_TIMEOUT_SECS > 0 and now - meta.get("spawned_at", 0) > TASK_TIMEOUT_SECS:
                     meta["status"] = "timeout"
                     meta["completed_at"] = now
                     _write_meta(task_id, meta)
@@ -692,6 +789,7 @@ def cleanup_stale_tasks(**kwargs) -> None:
                     _err_path(task_id),
                     TASKS_DIR / f"{task_id}.prompt",
                     TASKS_DIR / f"{task_id}.sh",
+                    _progress_path(task_id),
                 ]:
                     p.unlink(missing_ok=True)
                 logger.info(f"async-delegate: cleaned up stale task {task_id}")
@@ -715,6 +813,8 @@ def register(ctx) -> None:
             context=args.get("context", ""),
             inject_mode=args.get("inject_mode", "queue"),
             toolsets=args.get("toolsets", ""),
+            model=args.get("model", ""),
+            provider=args.get("provider", ""),
         ),
         schema={
             "name": "delegate_async",
@@ -768,6 +868,25 @@ def register(ctx) -> None:
                         ),
                         "default": ""
                     },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Optional model override for this task (e.g. \"step-3.7-flash\", \"qwen3.6-plus\", \"mimo-v2.5-pro\"). "
+                            "Priority: this parameter > delegation.model in config > main model. "
+                            "When set without 'provider', hermes auto-resolves the provider from the model name. "
+                            "Leave empty to use the delegation config model (set via `hermes config set delegation.model`)."
+                        ),
+                        "default": ""
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": (
+                            "Optional provider override for this task (e.g. \"zai\", \"custom:stepfun\", \"openrouter\"). "
+                            "Only needed when the model name alone isn't enough to identify the provider. "
+                            "When omitted with a model override, hermes auto-resolves the provider."
+                        ),
+                        "default": ""
+                    },
                 },
                 "required": ["goal"],
             },
@@ -813,4 +932,4 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", pre_llm_inject_results)
     ctx.register_hook("on_session_end", cleanup_stale_tasks)
 
-    logger.info("async-delegate plugin registered (v6 — dual-mode injection: queue + steer)")
+    logger.info("async-delegate plugin registered (v7 — delegation config model + per-task override)")

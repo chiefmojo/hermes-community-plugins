@@ -1,6 +1,6 @@
 name: async-delegate
-version: "1.1.0"
-description: "Async task delegation with dual-mode injection (queue/steer) — spawn background subagents via the async-delegation toolset without blocking the current turn"
+version: "1.2.0"
+description: "Async task delegation with dual-mode injection (queue/steer) and live progress tracking — spawn background subagents via the async-delegation toolset without blocking the current turn"
 author: "Furina"
 hooks:
   - pre_gateway_dispatch
