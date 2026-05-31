@@ -597,8 +597,9 @@ def run_maintenance(force: bool = False) -> None:
 # RULES:
 #   1. Bot that is @mentioned MUST respond (even if others already did)
 #   2. If multiple bots are @mentioned, ALL respond
-#   3. If no one is @mentioned, the designated bot for that chat_key responds
-#   4. If not mentioned and not assigned, stays silent
+#   3. If user replied to a bot's message (reply-to threading), that bot responds
+#   4. If no mention/reply, the designated bot for that chat_key responds
+#   5. If not mentioned, not replied-to, not assigned -> stays silent
 # ---------------------------------------------------------------------------
 
 _RESPONSE_COOLDOWN: float = 30.0  # seconds
@@ -660,13 +661,25 @@ def _get_bot_owned_chats() -> List[str]:
 
 
 def _is_bot_mentioned(user_message: str) -> bool:
-    """Check if this bot is @mentioned in the user message."""
+    """Check if this bot is @mentioned in the user message.
+
+    Uses word-boundary matching to avoid false positives
+    (e.g. 'bravo' in '@matias_bravos_dev_bot').
+    """
     if not user_message:
         return False
     msg_lower = user_message.lower()
     for name in _get_bot_mention_names():
-        if name.lower() in msg_lower:
-            return True
+        match = name.lower()
+        # Exact mention (@username or name with word boundary)
+        if match in msg_lower:
+            idx = msg_lower.find(match)
+            # Check char before and after for word boundary
+            before = msg_lower[idx - 1] if idx > 0 else " "
+            after = msg_lower[idx + len(match)] if idx + len(match) < len(msg_lower) else " "
+            if (idx == 0 or before == "@" or not before.isalnum()) and \
+               (idx + len(match) >= len(msg_lower) or not after.isalnum()):
+                return True
     return False
 
 
@@ -730,15 +743,60 @@ def _resolve_chat_key_from_kwargs(kwargs: dict) -> str:
     return f"unknown_{hashlib.md5(session_id.encode()).hexdigest()[:12]}"
 
 
+def _replied_to_bot(user_message: str) -> Optional[str]:
+    """Check if the user_message is a reply to a bot's message.
+
+    Hermes injects reply context as: [Replying to: "@bot_name text..."]
+    Returns the bot name if the replied-to message was from a known bot,
+    or None otherwise.
+    """
+    if not user_message or not user_message.startswith("[Replying to:"):
+        return None
+
+    # Build reverse map: @username -> profile_name
+    raw = os.environ.get("KANBAN_CONTEXT_MENTION_MAP", "").strip()
+    if not raw:
+        return None
+
+    username_to_profile: Dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        profile, username = pair.split("=", 1)
+        username_to_profile[username.strip().lower().lstrip("@")] = profile.strip()
+
+    # Extract the @username from: [Replying to: "@username rest..."]
+    rest = user_message[len("[Replying to: "):]
+    if rest.startswith('"'):
+        rest = rest[1:]
+    # Read until space, @, or "
+    mentioned = ""
+    for ch in rest:
+        if ch in ('"', ' ', ']'):
+            break
+        mentioned += ch
+
+    if not mentioned:
+        return None
+
+    mentioned_clean = mentioned.lower().lstrip("@")
+    if mentioned_clean in username_to_profile:
+        return username_to_profile[mentioned_clean]
+
+    return None
+
+
 def claim_response(user_message: str, chat_key: str) -> bool:
     """Decide whether THIS bot should respond based on coordination rules.
 
     Priority:
       1. If this bot is @mentioned → ALWAYS respond
       2. If other bots are @mentioned and this one ISN'T → skip
-      3. If NO @mentions → check designated topic assignment
-      4. If designated → respond
-      5. If not designated → skip (unless no assignment, then legacy: first-wins)
+      3. If user replied to a bot's message → that bot responds
+      4. If no mentions/reply → check designated topic assignment
+      5. If designated → respond
+      6. If not designated → skip (unless no assignment, then legacy: first-wins)
 
     Returns True if bot should respond, False if it should stay silent.
     """
@@ -749,24 +807,29 @@ def claim_response(user_message: str, chat_key: str) -> bool:
     bot = _my_bot_name()
     im_mentioned = _is_bot_mentioned(user_message)
     all_mentioned = _mentioned_bots(user_message)
+    replied_to = _replied_to_bot(user_message)
 
     # RULE 1: I'm @mentioned → always respond
     if im_mentioned:
-        logger.debug(
-            "kanban-context: claim=YES (mentioned) bot=%s chat=%s",
-            bot, chat_key,
-        )
+        logger.debug("kanban-context: claim=YES (mentioned) bot=%s", bot)
         _record_response_claim(bot, chat_key, msg_trimmed)
         return True
 
     # RULE 2: Other bots mentioned, I'm not → skip
     if all_mentioned:
         mentioned_str = ", ".join(all_mentioned)
-        logger.info(
-            "kanban-context: claim=NO (others mentioned: %s) bot=%s chat=%s",
-            mentioned_str, bot, chat_key,
-        )
+        logger.info("kanban-context: claim=NO (others mentioned: %s) bot=%s", mentioned_str, bot)
         return False
+
+    # RULE 3: User replied to a bot → that bot responds
+    if replied_to:
+        if replied_to == bot:
+            logger.debug("kanban-context: claim=YES (replied-to) bot=%s", bot)
+            _record_response_claim(bot, chat_key, msg_trimmed)
+            return True
+        else:
+            logger.info("kanban-context: claim=NO (replied to %s) bot=%s", replied_to, bot)
+            return False
 
     # RULE 3-5: No @mentions → check designation
     # First, check if someone already claimed this slot
@@ -857,6 +920,7 @@ def _inject_response_coordination(**kwargs) -> Optional[Dict[str, str]]:
     im_mentioned = _is_bot_mentioned(user_message)
     all_mentioned = _mentioned_bots(user_message)
     is_designated = _is_designated_bot_for_chat(chat_key)
+    replied_to = _replied_to_bot(user_message)
 
     # Check other respondents
     conn = _open_shared_db()
@@ -877,11 +941,13 @@ def _inject_response_coordination(**kwargs) -> Optional[Dict[str, str]]:
 
     # Build context
     if im_mentioned:
-        lines.append(f"**You were @mentioned** — you MUST respond to this message.")
+        lines.append("**You were @mentioned** — you MUST respond to this message.")
     if all_mentioned:
-        lines.append(f"Also mentioned: **{', '.join(all_mentioned)}**")
+        lines.append("Also mentioned: **" + ", ".join(all_mentioned) + "**")
+    if replied_to:
+        lines.append("User replied to **" + replied_to + "** — they should respond.")
     if is_designated:
-        lines.append(f"This chat is assigned to **{bot}** — you are the primary responder.")
+        lines.append("This chat is assigned to **" + bot + "** — you are the primary responder.")
     if others:
         lines.append("")
         for responder, ts in others:
@@ -891,6 +957,8 @@ def _inject_response_coordination(**kwargs) -> Optional[Dict[str, str]]:
     lines.append("")
     if im_mentioned:
         lines.append("→ Respond. You were called out.")
+    elif replied_to and replied_to == bot:
+        lines.append("→ Respond. User replied to your message.")
     elif all_mentioned and not im_mentioned:
         lines.append("→ Skip. Others were @mentioned, not you.")
     elif is_designated:
