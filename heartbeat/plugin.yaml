@@ -1,0 +1,16 @@
+name: heartbeat
+version: "1.0.0"
+description: "Proactive agent heartbeat — scheduled cheap-agent runner with state tracking and NOTHING_TO_FLAG suppression"
+author: "kaishi00"
+hooks:
+  - pre_gateway_dispatch
+config:
+  default_interval: 1800
+  default_model: "deepseek/deepseek-v4-flash"
+  default_prompt_file: "~/.hermes/HEARTBEAT.md"
+  state_db: "~/.hermes/data/heartbeat.db"
+  quiet_hours_start: "23:00"
+  quiet_hours_end: "07:00"
+  timezone: "America/New_York"
+  state_ttl_hours: 48
+  log_retention_days: 30

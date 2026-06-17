@@ -299,6 +299,54 @@ Bypass the auxiliary vision model and send images directly to vision-capable mai
 | `max_total_image_tokens` | `100000` | Token budget for all images combined |
 | `vision_models` | *(see file)* | Model name allowlist (substring match) |
 
+### 5. [`heartbeat/`](./heartbeat/) 💓
+
+**Proactive scheduled agent runner — wakes a cheap LLM on a schedule, runs your checks, and only notifies you when something needs attention.**
+
+A Hermes Agent plugin that spawns a lightweight subprocess agent on a configurable interval. It reads your `HEARTBEAT.md` as instructions (the prompt IS the program), runs with full agent tools, and stays silent when there's nothing to report (`NOTHING_TO_FLAG` suppression).
+
+#### How It Works
+
+```
+1. Timer fires (every 30m, configurable)
+2. Plugin reads HEARTBEAT.md from disk
+3. Plugin reads last state from SQLite (what was already flagged)
+4. Plugin spawns `hermes chat` subprocess with a cheap model
+5. Subprocess runs with FULL agent tools — calls whatever HEARTBEAT.md told it to
+6. Response comes back:
+   - NOTHING_TO_FLAG → silent, no delivery
+   - Findings → delivered to user's chat automatically
+```
+
+**Architecture:**
+- **Background scheduler** — daemon thread polls every 10 seconds, guarded by cross-process `flock` (only one process runs the scheduler)
+- **Subprocess execution** — each heartbeat runs as an isolated `hermes chat` process with a cheap model override (not your main agent model)
+- **SQLite state** — persistent storage at `~/.hermes/data/heartbeat.db` (WAL mode)
+- **Quiet hours** — heartbeats skip during quiet periods and reschedule automatically
+- **Per-heartbeat locks** — prevents overlapping runs of the same heartbeat
+- **Global concurrency semaphore** — limits simultaneous subprocess count (each loads ~500MB)
+
+#### Tools
+
+| Tool | Description |
+|------|-------------|
+| `heartbeat_create` | Create a recurring heartbeat with name, schedule, model, quiet hours, etc. |
+| `heartbeat_list` | List all heartbeats with status, last run, next run, and run count |
+| `heartbeat_run` | Manually trigger a heartbeat immediately (ignores schedule and quiet hours) |
+
+#### Config (`plugin.yaml`)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `default_interval` | `1800` | Default interval in seconds (30 min) |
+| `default_model` | `deepseek/deepseek-v4-flash` | Cheap model for heartbeat runs |
+| `default_prompt_file` | `~/.hermes/HEARTBEAT.md` | Default prompt file path |
+| `quiet_hours_start` | `23:00` | Start of quiet period (24h format) |
+| `quiet_hours_end` | `07:00` | End of quiet period (24h format) |
+| `timezone` | `America/New_York` | Timezone for quiet hours |
+| `state_ttl_hours` | `48` | How long to keep state entries |
+| `log_retention_days` | `30` | How long to keep run logs |
+
 ---
 
 ## Requirements
@@ -308,6 +356,7 @@ Bypass the auxiliary vision model and send images directly to vision-capable mai
 - **`async-delegate`:** No extra dependencies — uses Python stdlib only
 - **`multi-agent-context`:** `pip install requests` (usually already installed). Telegram path uses Python's built-in `sqlite3` — no extra deps.
 - **`kanban-context`:** No extra dependencies — uses Python stdlib only (`sqlite3`, `json`, `os`)
+- **`heartbeat`:** No extra dependencies — uses Python stdlib only (`sqlite3`, `threading`, `subprocess`, `fcntl`)
 
 ## Deployment Notes
 
