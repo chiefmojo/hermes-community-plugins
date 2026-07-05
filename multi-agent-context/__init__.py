@@ -16,11 +16,14 @@ Wires two behaviours:
    - platform=telegram: reads from the shared SQLite DB written by hook #1.
 
 Configuration (environment variables):
-    MULTI_AGENT_HISTORY_COUNT  — Messages to keep per chat in context (default: 20)
-    MULTI_AGENT_BOT_NAME       — Display name for this bot in the shared history.
-                                  Defaults to the agent name from the session key.
-    MULTI_AGENT_TG_DB_PATH     — Override default SQLite DB path.
-    DISCORD_BOT_TOKEN          — Discord Bot token (already set by Hermes).
+    MULTI_AGENT_HISTORY_COUNT   — Messages to keep per chat in context (default: 20)
+    MULTI_AGENT_BOT_NAME        — Display name for this bot in the shared history.
+                                   Defaults to the agent name from the session key.
+    MULTI_AGENT_TG_DB_PATH      — Override default SQLite DB path.
+    MULTI_AGENT_SKIP_CHANNELS   — Comma-separated Discord channel IDs to skip context
+                                   injection (e.g. free_response_channels that already
+                                   have full conversational context). Empty = skip nothing.
+    DISCORD_BOT_TOKEN           — Discord Bot token (already set by Hermes).
 
 No core Hermes files are modified.  Survives updates automatically.
 """
@@ -31,7 +34,7 @@ import logging
 import os
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,13 @@ def _history_count() -> int:
         return int(os.environ.get("MULTI_AGENT_HISTORY_COUNT", "20"))
     except ValueError:
         return 20
+
+
+_SKIP_IDS: Set[str] = {
+    cid.strip()
+    for cid in os.environ.get("MULTI_AGENT_SKIP_CHANNELS", "").split(",")
+    if cid.strip()
+}
 
 
 # ---------------------------------------------------------------------------
@@ -129,14 +139,14 @@ def _format_discord_messages(messages: List[dict], self_bot_id: Optional[str], l
         author = msg.get("author", {})
         author_id = str(author.get("id", ""))
         content = msg.get("content", "").strip()
-        if author_id == self_bot_id or not content or msg.get("type", 0) > 3:
+        if author_id == self_bot_id or not content or msg.get("type", 0) not in (0, 19):
             continue
         display = author.get("global_name") or author.get("username") or f"User-{author_id[:6]}"
         content = re.sub(r"<@!?(\d+)>", r"@<\1>", content)
         content = re.sub(r"<@&(\d+)>", r"@<role:\1>", content)
         content = re.sub(r"<#(\d+)>", r"#<\1>", content)
-        if len(content) > 500:
-            content = content[:497] + "..."
+        if len(content) > 2000:
+            content = content[:1997] + "..."
         lines.append(f"**{display}**: {content}")
     if len(lines) <= 2:
         return ""
@@ -328,11 +338,21 @@ def _inject_channel_context(**kwargs) -> Optional[dict]:
     platform = kwargs.get("platform", "")
 
     if platform == "discord":
+        if kwargs.get("is_first_turn"):
+            return None
+
         if not _load_discord_config():
             return None
 
         target_id, is_thread = _resolve_target(**kwargs)
         if not target_id:
+            return None
+
+        if target_id in _SKIP_IDS:
+            logger.debug(
+                "multi-agent-context: [discord] skipping channel %s (in MULTI_AGENT_SKIP_CHANNELS)",
+                target_id,
+            )
             return None
 
         label = "Thread" if is_thread else "Channel"
@@ -380,7 +400,7 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", _record_telegram_turn)
     ctx.register_hook("pre_llm_call", _inject_channel_context)
     logger.info(
-        "multi-agent-context plugin v2.0 registered "
-        "(history_count=%d, platforms=discord+telegram, tg_db=%s)",
-        _history_count(), _tg_db_path(),
+        "multi-agent-context plugin v2.2 registered "
+        "(history_count=%d, platforms=discord+telegram, tg_db=%s, skip_channels=%d)",
+        _history_count(), _tg_db_path(), len(_SKIP_IDS),
     )
