@@ -49,6 +49,9 @@ _SELF_BOT_ID: Optional[str] = None
 _discord_cache: Dict[str, Tuple[float, str]] = {}
 _CACHE_TTL: float = 10.0
 
+# Discord channel-type cache: channel_id -> is_dm (channel types never change)
+_dm_channel_cache: Dict[str, bool] = {}
+
 _TG_DB_TTL_HOURS: float = 48.0  # Prune messages older than this
 
 
@@ -116,6 +119,26 @@ def _get_discord_bot_user_id() -> Optional[str]:
     except Exception as exc:
         logger.warning("multi-agent-context: failed to get Discord bot user_id: %s", exc)
     return None
+
+
+def _is_dm_channel(channel_id: str) -> bool:
+    """True if the channel is a DM (type 1) or group DM (type 3).
+
+    DMs never need multi-agent context — only one agent lives there — and
+    injecting the channel's own history duplicates the live conversation
+    (and resurfaces pre-reset messages after a session reset). Result is
+    cached permanently; on API failure we assume non-DM so existing
+    channel behaviour is preserved.
+    """
+    cached = _dm_channel_cache.get(channel_id)
+    if cached is not None:
+        return cached
+    resp = _discord_get(f"channels/{channel_id}")
+    if not isinstance(resp, dict) or "type" not in resp:
+        return False  # unknown — don't cache, don't block
+    is_dm = resp["type"] in (1, 3)
+    _dm_channel_cache[channel_id] = is_dm
+    return is_dm
 
 
 def _resolve_target(**kwargs) -> Tuple[Optional[str], bool]:
@@ -355,6 +378,13 @@ def _inject_channel_context(**kwargs) -> Optional[dict]:
             )
             return None
 
+        if not is_thread and _is_dm_channel(target_id):
+            logger.debug(
+                "multi-agent-context: [discord] skipping DM channel %s",
+                target_id,
+            )
+            return None
+
         label = "Thread" if is_thread else "Channel"
         now = time.time()
         cached = _discord_cache.get(target_id)
@@ -400,7 +430,7 @@ def register(ctx) -> None:
     ctx.register_hook("post_llm_call", _record_telegram_turn)
     ctx.register_hook("pre_llm_call", _inject_channel_context)
     logger.info(
-        "multi-agent-context plugin v2.2 registered "
+        "multi-agent-context plugin v2.3 registered "
         "(history_count=%d, platforms=discord+telegram, tg_db=%s, skip_channels=%d)",
         _history_count(), _tg_db_path(), len(_SKIP_IDS),
     )
